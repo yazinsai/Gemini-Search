@@ -1,290 +1,303 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import {
-  GoogleGenerativeAI,
-  type ChatSession,
-  type GenerateContentResult,
+	GoogleGenerativeAI,
+	type ChatSession,
+	type GenerateContentResult,
 } from "@google/generative-ai";
 import { marked } from "marked";
-import { setupEnvironment } from "./env";
-
-const env = setupEnvironment();
-const genAI = new GoogleGenerativeAI(env.GOOGLE_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.0-flash-exp",
-  generationConfig: {
-    temperature: 0.9,
-    topP: 1,
-    topK: 1,
-    maxOutputTokens: 2048,
-  },
-});
 
 // Store chat sessions in memory
 const chatSessions = new Map<string, ChatSession>();
 
 // Format raw text into proper markdown
 async function formatResponseToMarkdown(
-  text: string | Promise<string>
+	text: string | Promise<string>,
 ): Promise<string> {
-  // Ensure we have a string to work with
-  const resolvedText = await Promise.resolve(text);
+	// Ensure we have a string to work with
+	const resolvedText = await Promise.resolve(text);
 
-  // First, ensure consistent newlines
-  let processedText = resolvedText.replace(/\r\n/g, "\n");
+	// First, ensure consistent newlines
+	let processedText = resolvedText.replace(/\r\n/g, "\n");
 
-  // Process main sections (lines that start with word(s) followed by colon)
-  processedText = processedText.replace(
-    /^([A-Za-z][A-Za-z\s]+):(\s*)/gm,
-    "## $1$2"
-  );
+	// Process main sections (lines that start with word(s) followed by colon)
+	processedText = processedText.replace(
+		/^([A-Za-z][A-Za-z\s]+):(\s*)/gm,
+		"## $1$2",
+	);
 
-  // Process sub-sections (any remaining word(s) followed by colon within text)
-  processedText = processedText.replace(
-    /(?<=\n|^)([A-Za-z][A-Za-z\s]+):(?!\d)/gm,
-    "### $1"
-  );
+	// Process sub-sections (any remaining word(s) followed by colon within text)
+	processedText = processedText.replace(
+		/(?<=\n|^)([A-Za-z][A-Za-z\s]+):(?!\d)/gm,
+		"### $1",
+	);
 
-  // Process bullet points
-  processedText = processedText.replace(/^[•●○]\s*/gm, "* ");
+	// Process bullet points
+	processedText = processedText.replace(/^[•●○]\s*/gm, "* ");
 
-  // Split into paragraphs
-  const paragraphs = processedText.split("\n\n").filter(Boolean);
+	// Split into paragraphs
+	const paragraphs = processedText.split("\n\n").filter(Boolean);
 
-  // Process each paragraph
-  const formatted = paragraphs
-    .map((p) => {
-      // If it's a header or list item, preserve it
-      if (p.startsWith("#") || p.startsWith("*") || p.startsWith("-")) {
-        return p;
-      }
-      // Add proper paragraph formatting
-      return `${p}\n`;
-    })
-    .join("\n\n");
+	// Process each paragraph
+	const formatted = paragraphs
+		.map((p) => {
+			// If it's a header or list item, preserve it
+			if (p.startsWith("#") || p.startsWith("*") || p.startsWith("-")) {
+				return p;
+			}
+			// Add proper paragraph formatting
+			return `${p}\n`;
+		})
+		.join("\n\n");
 
-  // Configure marked options for better header rendering
-  marked.setOptions({
-    gfm: true,
-    breaks: true,
-  });
+	// Configure marked options for better header rendering
+	marked.setOptions({
+		gfm: true,
+		breaks: true,
+	});
 
-  // Convert markdown to HTML using marked
-  return marked.parse(formatted);
+	// Convert markdown to HTML using marked
+	return marked.parse(formatted);
 }
 
 interface WebSource {
-  uri: string;
-  title: string;
+	uri: string;
+	title: string;
 }
 
 interface GroundingChunk {
-  web?: WebSource;
+	web?: WebSource;
 }
 
 interface TextSegment {
-  startIndex: number;
-  endIndex: number;
-  text: string;
+	startIndex: number;
+	endIndex: number;
+	text: string;
 }
 
 interface GroundingSupport {
-  segment: TextSegment;
-  groundingChunkIndices: number[];
-  confidenceScores: number[];
+	segment: TextSegment;
+	groundingChunkIndices: number[];
+	confidenceScores: number[];
 }
 
 interface GroundingMetadata {
-  groundingChunks: GroundingChunk[];
-  groundingSupports: GroundingSupport[];
-  searchEntryPoint?: any;
-  webSearchQueries?: string[];
+	groundingChunks: GroundingChunk[];
+	groundingSupports: GroundingSupport[];
+	searchEntryPoint?: any;
+	webSearchQueries?: string[];
 }
 
 export function registerRoutes(app: Express): Server {
-  // Search endpoint - creates a new chat session
-  app.get("/api/search", async (req, res) => {
-    try {
-      const query = req.query.q as string;
+	// Search endpoint - creates a new chat session
+	app.get("/api/search", async (req, res) => {
+		try {
+			const query = req.query.q as string;
+			const apiKey = req.headers["x-api-key"] as string;
 
-      if (!query) {
-        return res.status(400).json({
-          message: "Query parameter 'q' is required",
-        });
-      }
+			if (!query) {
+				return res.status(400).json({
+					message: "Query parameter 'q' is required",
+				});
+			}
 
-      // Create a new chat session with search capability
-      const chat = model.startChat({
-        tools: [
-          {
-            // @ts-ignore - google_search is a valid tool but not typed in the SDK yet
-            google_search: {},
-          },
-        ],
-      });
+			if (!apiKey) {
+				return res.status(401).json({
+					message: "API key is required",
+				});
+			}
 
-      // Generate content with search tool
-      const result = await chat.sendMessage(query);
-      const response = await result.response;
-      console.log(
-        "Raw Google API Response:",
-        JSON.stringify(
-          {
-            text: response.text(),
-            candidates: response.candidates,
-            groundingMetadata: response.candidates?.[0]?.groundingMetadata,
-          },
-          null,
-          2
-        )
-      );
-      const text = response.text();
+			// Create Gemini client with provided API key
+			const genAI = new GoogleGenerativeAI(apiKey);
+			const model = genAI.getGenerativeModel({
+				model: "gemini-2.0-flash-exp",
+				generationConfig: {
+					temperature: 0.9,
+					topP: 1,
+					topK: 1,
+					maxOutputTokens: 2048,
+				},
+			});
 
-      // Format the response text to proper markdown/HTML
-      const formattedText = await formatResponseToMarkdown(text);
+			// Create a new chat session with search capability
+			const chat = model.startChat({
+				tools: [
+					{
+						// @ts-ignore - google_search is a valid tool but not typed in the SDK yet
+						google_search: {},
+					},
+				],
+			});
 
-      // Extract sources from grounding metadata
-      const sourceMap = new Map<
-        string,
-        { title: string; url: string; snippet: string }
-      >();
+			// Generate content with search tool
+			const result = await chat.sendMessage(query);
+			const response = await result.response;
+			console.log(
+				"Raw Google API Response:",
+				JSON.stringify(
+					{
+						text: response.text(),
+						candidates: response.candidates,
+						groundingMetadata: response.candidates?.[0]?.groundingMetadata,
+					},
+					null,
+					2,
+				),
+			);
+			const text = response.text();
 
-      // Get grounding metadata from response
-      const metadata = response.candidates?.[0]?.groundingMetadata as any;
-      if (metadata) {
-        const chunks = metadata.groundingChunks || [];
-        const supports = metadata.groundingSupports || [];
+			// Format the response text to proper markdown/HTML
+			const formattedText = await formatResponseToMarkdown(text);
 
-        chunks.forEach((chunk: any, index: number) => {
-          if (chunk.web?.uri && chunk.web?.title) {
-            const url = chunk.web.uri;
-            if (!sourceMap.has(url)) {
-              // Find snippets that reference this chunk
-              const snippets = supports
-                .filter((support: any) =>
-                  support.groundingChunkIndices.includes(index)
-                )
-                .map((support: any) => support.segment.text)
-                .join(" ");
+			// Extract sources from grounding metadata
+			const sourceMap = new Map<
+				string,
+				{ title: string; url: string; snippet: string }
+			>();
 
-              sourceMap.set(url, {
-                title: chunk.web.title,
-                url: url,
-                snippet: snippets || "",
-              });
-            }
-          }
-        });
-      }
+			// Get grounding metadata from response
+			const metadata = response.candidates?.[0]?.groundingMetadata as any;
+			if (metadata) {
+				const chunks = metadata.groundingChunks || [];
+				const supports = metadata.groundingSupports || [];
 
-      const sources = Array.from(sourceMap.values());
+				chunks.forEach((chunk: any, index: number) => {
+					if (chunk.web?.uri && chunk.web?.title) {
+						const url = chunk.web.uri;
+						if (!sourceMap.has(url)) {
+							// Find snippets that reference this chunk
+							const snippets = supports
+								.filter((support: any) =>
+									support.groundingChunkIndices.includes(index),
+								)
+								.map((support: any) => support.segment.text)
+								.join(" ");
 
-      // Generate a session ID and store the chat
-      const sessionId = Math.random().toString(36).substring(7);
-      chatSessions.set(sessionId, chat);
+							sourceMap.set(url, {
+								title: chunk.web.title,
+								url: url,
+								snippet: snippets || "",
+							});
+						}
+					}
+				});
+			}
 
-      res.json({
-        sessionId,
-        summary: formattedText,
-        sources,
-      });
-    } catch (error: any) {
-      console.error("Search error:", error);
-      res.status(500).json({
-        message:
-          error.message || "An error occurred while processing your search",
-      });
-    }
-  });
+			const sources = Array.from(sourceMap.values());
 
-  // Follow-up endpoint - continues existing chat session
-  app.post("/api/follow-up", async (req, res) => {
-    try {
-      const { sessionId, query } = req.body;
+			// Generate a session ID and store the chat
+			const sessionId = Math.random().toString(36).substring(7);
+			chatSessions.set(sessionId, chat);
 
-      if (!sessionId || !query) {
-        return res.status(400).json({
-          message: "Both sessionId and query are required",
-        });
-      }
+			res.json({
+				sessionId,
+				summary: formattedText,
+				sources,
+			});
+		} catch (error: any) {
+			console.error("Search error:", error);
+			res.status(500).json({
+				message:
+					error.message || "An error occurred while processing your search",
+			});
+		}
+	});
 
-      const chat = chatSessions.get(sessionId);
-      if (!chat) {
-        return res.status(404).json({
-          message: "Chat session not found",
-        });
-      }
+	// Follow-up endpoint - continues existing chat session
+	app.post("/api/follow-up", async (req, res) => {
+		try {
+			const { sessionId, query } = req.body;
+			const apiKey = req.headers["x-api-key"] as string;
 
-      // Send follow-up message in existing chat
-      const result = await chat.sendMessage(query);
-      const response = await result.response;
-      console.log(
-        "Raw Google API Follow-up Response:",
-        JSON.stringify(
-          {
-            text: response.text(),
-            candidates: response.candidates,
-            groundingMetadata: response.candidates?.[0]?.groundingMetadata,
-          },
-          null,
-          2
-        )
-      );
-      const text = response.text();
+			if (!sessionId || !query) {
+				return res.status(400).json({
+					message: "Both sessionId and query are required",
+				});
+			}
 
-      // Format the response text to proper markdown/HTML
-      const formattedText = await formatResponseToMarkdown(text);
+			if (!apiKey) {
+				return res.status(401).json({
+					message: "API key is required",
+				});
+			}
 
-      // Extract sources from grounding metadata
-      const sourceMap = new Map<
-        string,
-        { title: string; url: string; snippet: string }
-      >();
+			const chat = chatSessions.get(sessionId);
+			if (!chat) {
+				return res.status(404).json({
+					message: "Chat session not found",
+				});
+			}
 
-      // Get grounding metadata from response
-      const metadata = response.candidates?.[0]?.groundingMetadata as any;
-      if (metadata) {
-        const chunks = metadata.groundingChunks || [];
-        const supports = metadata.groundingSupports || [];
+			// Send follow-up message in existing chat
+			const result = await chat.sendMessage(query);
+			const response = await result.response;
+			console.log(
+				"Raw Google API Follow-up Response:",
+				JSON.stringify(
+					{
+						text: response.text(),
+						candidates: response.candidates,
+						groundingMetadata: response.candidates?.[0]?.groundingMetadata,
+					},
+					null,
+					2,
+				),
+			);
+			const text = response.text();
 
-        chunks.forEach((chunk: any, index: number) => {
-          if (chunk.web?.uri && chunk.web?.title) {
-            const url = chunk.web.uri;
-            if (!sourceMap.has(url)) {
-              // Find snippets that reference this chunk
-              const snippets = supports
-                .filter((support: any) =>
-                  support.groundingChunkIndices.includes(index)
-                )
-                .map((support: any) => support.segment.text)
-                .join(" ");
+			// Format the response text to proper markdown/HTML
+			const formattedText = await formatResponseToMarkdown(text);
 
-              sourceMap.set(url, {
-                title: chunk.web.title,
-                url: url,
-                snippet: snippets || "",
-              });
-            }
-          }
-        });
-      }
+			// Extract sources from grounding metadata
+			const sourceMap = new Map<
+				string,
+				{ title: string; url: string; snippet: string }
+			>();
 
-      const sources = Array.from(sourceMap.values());
+			// Get grounding metadata from response
+			const metadata = response.candidates?.[0]?.groundingMetadata as any;
+			if (metadata) {
+				const chunks = metadata.groundingChunks || [];
+				const supports = metadata.groundingSupports || [];
 
-      res.json({
-        summary: formattedText,
-        sources,
-      });
-    } catch (error: any) {
-      console.error("Follow-up error:", error);
-      res.status(500).json({
-        message:
-          error.message ||
-          "An error occurred while processing your follow-up question",
-      });
-    }
-  });
+				chunks.forEach((chunk: any, index: number) => {
+					if (chunk.web?.uri && chunk.web?.title) {
+						const url = chunk.web.uri;
+						if (!sourceMap.has(url)) {
+							// Find snippets that reference this chunk
+							const snippets = supports
+								.filter((support: any) =>
+									support.groundingChunkIndices.includes(index),
+								)
+								.map((support: any) => support.segment.text)
+								.join(" ");
 
-  const httpServer = createServer(app);
-  return httpServer;
+							sourceMap.set(url, {
+								title: chunk.web.title,
+								url: url,
+								snippet: snippets || "",
+							});
+						}
+					}
+				});
+			}
+
+			const sources = Array.from(sourceMap.values());
+
+			res.json({
+				summary: formattedText,
+				sources,
+			});
+		} catch (error: any) {
+			console.error("Follow-up error:", error);
+			res.status(500).json({
+				message:
+					error.message ||
+					"An error occurred while processing your follow-up question",
+			});
+		}
+	});
+
+	const httpServer = createServer(app);
+	return httpServer;
 }
